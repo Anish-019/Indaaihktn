@@ -1,26 +1,33 @@
 import pandas as pd
-import re
-from google.colab import drive
-from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
-from transformers import DataCollatorWithPadding
 import torch
-from torch.utils.data import Dataset
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-# Mount Google Drive
-drive.mount('/content/drive')
+# Load the data
+train_df = pd.read_csv('/path/to/train.csv')
+test_df = pd.read_csv('/path/to/test.csv')
 
-# Load datasets from Google Drive
-train_df = pd.read_csv('/content/drive/MyDrive/train.csv')
-test_df = pd.read_csv('/content/drive/MyDrive/test.csv')
+# Drop rows with NaN values in necessary columns
+train_df = train_df.dropna(subset=['crimeaditionalinfo', 'category', 'sub_category'])
+test_df = test_df.dropna(subset=['crimeaditionalinfo', 'category', 'sub_category'])
 
-# Combining 'sub_category' and 'crimeaditionalinfo' into a single text column
-train_df['text'] = train_df['sub_category'].astype(str) + ' ' + train_df['crimeaditionalinfo'].astype(str)
-test_df['text'] = test_df['sub_category'].astype(str) + ' ' + test_df['crimeaditionalinfo'].astype(str)
+# Encode labels
+train_df['label'] = train_df['category'].astype('category').cat.codes
+test_df['label'] = test_df['category'].astype('category').cat.codes
 
-# Define Dataset class for tokenization and label encoding
-class CyberDataset(Dataset):
+# Check and handle NaN values in the test labels
+if test_df['label'].isnull().any():
+    print("NaN values found in test labels. Removing rows with NaN labels.")
+    test_df = test_df.dropna(subset=['label']).reset_index(drop=True)
+
+# Convert labels to integers
+train_df['label'] = train_df['label'].astype(int)
+test_df['label'] = test_df['label'].astype(int)
+
+# Define a custom dataset class
+class CrimeDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_length=128):
         self.texts = texts
         self.labels = labels
@@ -32,94 +39,77 @@ class CyberDataset(Dataset):
 
     def __getitem__(self, idx):
         text = self.texts[idx]
-        label = int(self.labels[idx])  # Ensure label is converted to int
+        label = int(self.labels[idx])
         encoding = self.tokenizer.encode_plus(
             text,
-            truncation=True,
+            add_special_tokens=True,
             max_length=self.max_length,
             padding='max_length',
-            return_tensors="pt"
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
         )
+
         return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': torch.tensor(label, dtype=torch.long)  # Ensure int64 tensor
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
         }
 
-# Load tokenizer and model
+# Initialize the tokenizer and model
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=train_df['category'].nunique())
+model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=len(train_df['label'].unique()))
 
-# Encode labels
-label_mapping = {label: idx for idx, label in enumerate(train_df['category'].unique())}
-train_df['label'] = train_df['category'].map(label_mapping)
-test_df['label'] = test_df['category'].map(label_mapping)
+# Prepare datasets
+train_texts, val_texts, train_labels, val_labels = train_test_split(train_df['crimeaditionalinfo'], train_df['label'], test_size=0.2)
+train_dataset = CrimeDataset(train_texts.tolist(), train_labels.tolist(), tokenizer)
+val_dataset = CrimeDataset(val_texts.tolist(), val_labels.tolist(), tokenizer)
+test_dataset = CrimeDataset(test_df['crimeaditionalinfo'].tolist(), test_df['label'].tolist(), tokenizer)
 
-# Train-validation split
-X_train, X_val, y_train, y_val = train_test_split(train_df['text'], train_df['label'], test_size=0.2, random_state=42)
-
-# Create training, validation, and test datasets
-train_dataset = CyberDataset(X_train.tolist(), y_train.tolist(), tokenizer)
-val_dataset = CyberDataset(X_val.tolist(), y_val.tolist(), tokenizer)
-test_dataset = CyberDataset(test_df['text'].tolist(), test_df['label'].tolist(), tokenizer)
-
-# Training arguments
-training_args = TrainingArguments(
-    output_dir='./results',
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    learning_rate=2e-5,
-    per_device_train_batch_size=16,
-    per_device_eval_batch_size=16,
-    num_train_epochs=4,
-    weight_decay=0.01,
-    logging_dir='./logs',
-)
-
-# Data collator for dynamic padding
-data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-
-# Define evaluation metrics
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = logits.argmax(-1)
-    accuracy = accuracy_score(labels, predictions)
-    precision = precision_score(labels, predictions, average='weighted', zero_division=1)
-    recall = recall_score(labels, predictions, average='weighted', zero_division=1)
-    f1 = f1_score(labels, predictions, average='weighted', zero_division=1)
+# Define metrics
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='weighted')
+    acc = accuracy_score(labels, preds)
     return {
-        'accuracy': accuracy,
+        'accuracy': acc,
+        'f1': f1,
         'precision': precision,
-        'recall': recall,
-        'f1': f1
+        'recall': recall
     }
 
-# Trainer
+# Define training arguments
+training_args = TrainingArguments(
+    output_dir='./results',
+    evaluation_strategy='epoch',
+    learning_rate=2e-5,
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,
+    num_train_epochs=3,
+    weight_decay=0.01
+)
+
+# Initialize Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
-    tokenizer=tokenizer,
-    data_collator=data_collator,
     compute_metrics=compute_metrics
 )
 
 # Train the model
 trainer.train()
 
-# Evaluate on validation set
-val_metrics = trainer.evaluate(eval_dataset=val_dataset)
-print(f"Validation Metrics: {val_metrics}")
+# Evaluate the model on the validation set
+trainer.evaluate()
 
 # Make predictions on the test set
 test_preds = trainer.predict(test_dataset)
 test_pred_labels = test_preds.predictions.argmax(-1)
 
-# Map predictions back to original labels
-inverse_label_mapping = {v: k for k, v in label_mapping.items()}
-test_pred_categories = [inverse_label_mapping[label] for label in test_pred_labels]
-
-# Print classification report on test set
-print("Classification Report (Test):")
-print(classification_report(test_df['label'], test_pred_labels, target_names=list(label_mapping.keys())))
+# Optionally, save predictions in a DataFrame
+test_df['predicted_label'] = test_pred_labels
+test_df.to_csv('test_predictions.csv', index=False)
+print("Predictions saved to 'test_predictions.csv'")
