@@ -15,7 +15,7 @@ drive.mount('/content/drive')
 train_df = pd.read_csv('/content/drive/MyDrive/train.csv')
 test_df = pd.read_csv('/content/drive/MyDrive/test.csv')
 
-# Combine 'sub_category' and 'crimeaditionalinfo' into a single text column
+# Combining 'sub_category' and 'crimeaditionalinfo' into a single text column
 train_df['text'] = train_df['sub_category'].astype(str) + ' ' + train_df['crimeaditionalinfo'].astype(str)
 test_df['text'] = test_df['sub_category'].astype(str) + ' ' + test_df['crimeaditionalinfo'].astype(str)
 
